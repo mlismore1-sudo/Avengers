@@ -24,18 +24,35 @@ REST_BASE_URL = os.getenv("REST_BASE_URL", "https://api.company-information.serv
 STREAM_KEY = os.getenv("COMPANIES_HOUSE_STREAM_API_KEY")
 REST_KEY = os.getenv("COMPANIES_HOUSE_REST_API_KEY")
 STREAM_ENABLED = os.getenv("STREAM_ENABLED", "true").lower() == "true"
-ENRICHMENT_ENABLED = os.getenv("ENRICHMENT_ENABLED", "false").lower() == "true"
+ENRICHMENT_ENABLED = os.getenv("ENRICHMENT_ENABLED", "true").lower() == "true"
 
-# Replace these placeholders with the exact agreed criteria.
-TARGET_SIC_CODES = {code for code in os.getenv("TARGET_SIC_CODES", "").split(",") if code.strip()}
-RESTRICTED_SIC_CODES = {code for code in os.getenv("RESTRICTED_SIC_CODES", "").split(",") if code.strip()}
-BUZZWORDS = tuple(word.strip() for word in os.getenv("BUZZWORDS", "").split(",") if word.strip())
-TARGET_COUNTRIES = tuple(
-    country.strip().lower()
-    for country in os.getenv("TARGET_COUNTRIES", "EU,EEA,USA,India").split(",")
-    if country.strip()
+TARGET_SIC_CODES = {
+    "62012", "63110", "64209", "64301", "64999", "72110",
+}
+
+RESTRICTED_SIC_CODES = {
+    "46110", "46120", "46130", "46140", "46150", "46160", "46170", "46180", "46190",
+    "46210", "46220", "46230", "46240", "46310", "46320", "46330", "46341", "46342",
+    "46350", "46360", "46370", "46380", "46390", "46410", "46420", "46431", "46439",
+    "46440", "46450", "46460", "46470", "46480", "46499", "46510", "46520", "46530",
+    "46610", "46620", "46630", "46640", "46650", "46660", "46690", "46711", "46719",
+    "46720", "46730", "46740", "46750", "46900", "10110", "10130", "10310", "10410",
+    "10511", "10512", "10611", "10612", "10840", "10850", "10890", "10920", "13100",
+    "13200", "13300", "13921", "13923", "13960", "14131", "15110", "16290", "19200",
+    "20110", "20120", "20130", "20140", "20150", "20160", "20170", "20200", "20301",
+    "20302", "20411", "20412", "20590", "21100", "22210", "22290", "23190", "23910",
+    "23990", "24100", "24200", "24310", "24320", "24330", "24340", "24410", "24420",
+    "24430", "24440", "24450", "24460", "24510", "25110", "25210", "25500", "25990",
+    "26110", "26200", "26300", "26511", "26512", "26600", "27110", "27200", "28110",
+    "28290", "28300", "28990", "29100", "29310", "30110", "30300", "31090", "32990",
+}
+
+BUZZWORDS = (
+    "ai", "capital", "europe", "global", "group", "holdings", "inc", "labs",
+    "london", "pty", "pvt", "technologies", "technology", "uk",
 )
 
+TARGET_COUNTRIES = ("eu", "eea", "usa", "india")
 WORKER_NAME = "company_stream_worker"
 _worker_lock = threading.Lock()
 _worker_thread: threading.Thread | None = None
@@ -80,12 +97,12 @@ def normalized_sic(value: Any) -> str:
 
 def token_matches(text: str, words: Iterable[str]) -> list[str]:
     normalized = normalize(text)
-    matches: list[str] = []
-    for word in words:
-        candidate = normalize(word)
-        if candidate and re.search(rf"(?<![a-z0-9]){re.escape(candidate)}(?![a-z0-9])", normalized):
-            matches.append(candidate)
-    return sorted(set(matches))
+    return sorted({
+        normalize(word)
+        for word in words
+        if normalize(word)
+        and re.search(rf"(?<![a-z0-9]){re.escape(normalize(word))}(?![a-z0-9])", normalized)
+    })
 
 
 def matching_sics(codes: Iterable[Any], configured: Iterable[Any]) -> list[str]:
@@ -125,9 +142,7 @@ def update_status(status: str, error: str | None = None) -> None:
 
 
 def get_checkpoint() -> int | None:
-    row = db_fetch_one(
-        "select timepoint from public.stream_checkpoints where stream_name = 'companies'"
-    )
+    row = db_fetch_one("select timepoint from public.stream_checkpoints where stream_name = 'companies'")
     return int(row["timepoint"]) if row and row.get("timepoint") is not None else None
 
 
@@ -210,25 +225,19 @@ def process_event(payload: dict[str, Any], event_hash: str) -> None:
 
     received = datetime.utcnow()
     db_write(
-        """
-        insert into public.raw_events(event_type, company_number, payload, received_at)
-        values (%s, %s, %s, %s)
-        """,
+        "insert into public.raw_events(event_type, company_number, payload, received_at) values (%s, %s, %s, %s)",
         (event.get("type"), company_number, json.dumps(payload, default=str), received),
     )
 
-    profile = data
-    name = profile.get("company_name") or company_number
-    creation = parse_date(profile.get("date_of_creation"))
-
+    name = data.get("company_name") or company_number
+    creation = parse_date(data.get("date_of_creation"))
     if creation != uk_today():
         return
 
-    sics = profile.get("sic_codes") or []
+    sics = data.get("sic_codes") or []
     target_sics = matching_sics(sics, TARGET_SIC_CODES)
     restricted_sics = matching_sics(sics, RESTRICTED_SIC_CODES)
     buzzword_matches = token_matches(name, BUZZWORDS)
-
     if not (target_sics or restricted_sics or buzzword_matches):
         return
 
@@ -269,29 +278,16 @@ def process_event(payload: dict[str, Any], event_hash: str) -> None:
             last_screened_at = excluded.last_screened_at
         """,
         (
-            company_number,
-            name,
-            creation,
-            json.dumps(sics),
-            json.dumps({"stream": profile, "evidence": evidence}, default=str),
-            received,
-            received,
-            enrichment_status,
-            qualified,
-            lead_status,
-            json.dumps(buzzword_matches),
-            json.dumps(sorted(set(target_sics + restricted_sics))),
-            received,
+            company_number, name, creation, json.dumps(sics),
+            json.dumps({"stream": data, "evidence": evidence}, default=str),
+            received, received, enrichment_status, qualified, lead_status,
+            json.dumps(buzzword_matches), json.dumps(sorted(set(target_sics + restricted_sics))), received,
         ),
     )
 
     if restricted and not ENRICHMENT_ENABLED:
         db_write(
-            """
-            insert into public.enrichment_jobs(company_number, enrichment_scope)
-            values (%s, 'initial_rest')
-            on conflict (company_number, enrichment_scope) do nothing
-            """,
+            "insert into public.enrichment_jobs(company_number, enrichment_scope) values (%s, 'initial_rest') on conflict (company_number, enrichment_scope) do nothing",
             (company_number,),
         )
 
@@ -310,14 +306,7 @@ def stream_loop() -> None:
             update_status("connecting")
             checkpoint = get_checkpoint()
             params = {} if checkpoint is None else {"timepoint": checkpoint}
-            with requests.get(
-                STREAM_URL,
-                params=params,
-                auth=(STREAM_KEY, ""),
-                headers={"Accept": "application/json"},
-                stream=True,
-                timeout=(30, 300),
-            ) as response:
+            with requests.get(STREAM_URL, params=params, auth=(STREAM_KEY, ""), headers={"Accept": "application/json"}, stream=True, timeout=(30, 300)) as response:
                 response.raise_for_status()
                 update_status("connected")
                 for line in response.iter_lines(decode_unicode=True):
@@ -326,9 +315,7 @@ def stream_loop() -> None:
                     if not line:
                         continue
                     payload = json.loads(line)
-                    digest = hashlib.sha256(
-                        json.dumps(payload, sort_keys=True).encode("utf-8")
-                    ).hexdigest()
+                    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
                     process_event(payload, digest)
                     event = payload.get("event") or {}
                     if event.get("timepoint") is not None:
@@ -358,19 +345,11 @@ def start_worker() -> bool:
 
 def health() -> tuple[str, dict[str, Any] | None]:
     try:
-        row = db_fetch_one(
-            "select * from public.worker_status where worker_name = %s",
-            (WORKER_NAME,),
-        )
+        row = db_fetch_one("select * from public.worker_status where worker_name = %s", (WORKER_NAME,))
     except Exception as exc:
         return f"Database error: {exc}", None
     if not row:
         return "Not started", None
-    heartbeat = row.get("heartbeat_at")
-    if heartbeat and heartbeat.tzinfo is None:
-        heartbeat = heartbeat.replace(tzinfo=datetime.now().astimezone().tzinfo)
-    if heartbeat and (datetime.now(heartbeat.tzinfo) - heartbeat).total_seconds() > 300:
-        return "Stale", row
     return str(row.get("status") or "Unknown"), row
 
 
@@ -379,11 +358,9 @@ def dashboard() -> None:
     try:
         with db_connection() as conn:
             conn.execute("select 1").fetchone()
-        db_ok = True
-        db_error = ""
+        db_ok, db_error = True, ""
     except Exception as exc:
-        db_ok = False
-        db_error = str(exc)
+        db_ok, db_error = False, str(exc)
 
     worker_status, worker_row = health()
     c1, c2, c3 = st.columns(3)
@@ -396,24 +373,12 @@ def dashboard() -> None:
         st.warning(worker_row["last_error"])
 
     if st.button("Start worker", type="primary"):
-        if start_worker():
-            st.success("Worker started")
-        else:
-            st.info("Worker is already running")
+        st.success("Worker started") if start_worker() else st.info("Worker is already running")
     if st.button("Refresh"):
         st.rerun()
 
     try:
-        rows = db_fetch_all(
-            """
-            select company_number, company_name, date_of_creation, sic_codes,
-                   enrichment_status, lead_status, matched_buzzwords,
-                   matched_sic_codes, incorporated_today, raw_data,
-                   first_seen_at, last_seen_at
-            from public.qualifying_leads
-            order by first_seen_at desc
-            """
-        )
+        rows = db_fetch_all("select * from public.qualifying_leads order by first_seen_at desc")
         st.subheader("Qualifying companies")
         st.dataframe(rows, use_container_width=True)
     except Exception as exc:
