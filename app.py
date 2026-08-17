@@ -19,41 +19,37 @@ from psycopg.rows import dict_row
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("thanos")
 
-STREAM_URL = os.getenv("STREAM_URL", "https://stream.companieshouse.gov.uk/companies")
-REST_BASE_URL = os.getenv("REST_BASE_URL", "https://api.company-information.service.gov.uk").rstrip("/")
-STREAM_KEY = os.getenv("COMPANIES_HOUSE_STREAM_API_KEY")
-REST_KEY = os.getenv("COMPANIES_HOUSE_REST_API_KEY")
-STREAM_ENABLED = os.getenv("STREAM_ENABLED", "true").lower() == "true"
-ENRICHMENT_ENABLED = os.getenv("ENRICHMENT_ENABLED", "true").lower() == "true"
+
+def setting(name: str, default: str | None = None) -> str | None:
+    value = os.getenv(name)
+    if value:
+        return value
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    return str(value) if value is not None else default
+
+
+STREAM_URL = setting("STREAM_URL", "https://stream.companieshouse.gov.uk/companies")
+REST_BASE_URL = (setting("REST_BASE_URL", "https://api.company-information.service.gov.uk") or "").rstrip("/")
+STREAM_KEY = setting("COMPANIES_HOUSE_STREAM_API_KEY")
+REST_KEY = setting("COMPANIES_HOUSE_REST_API_KEY")
+STREAM_ENABLED = (setting("STREAM_ENABLED", "true") or "true").lower() == "true"
+ENRICHMENT_ENABLED = (setting("ENRICHMENT_ENABLED", "true") or "true").lower() == "true"
 
 TARGET_SIC_CODES = {"62012", "63110", "64209", "64301", "64999", "72110"}
-RESTRICTED_SIC_CODES = {
-    "46110", "46120", "46130", "46140", "46150", "46160", "46170", "46180", "46190",
-    "46210", "46220", "46230", "46240", "46310", "46320", "46330", "46341", "46342",
-    "46350", "46360", "46370", "46380", "46390", "46410", "46420", "46431", "46439",
-    "46440", "46450", "46460", "46470", "46480", "46499", "46510", "46520", "46530",
-    "46610", "46620", "46630", "46640", "46650", "46660", "46690", "46711", "46719",
-    "46720", "46730", "46740", "46750", "46900", "10110", "10130", "10310", "10410",
-    "10511", "10512", "10611", "10612", "10840", "10850", "10890", "10920", "13100",
-    "13200", "13300", "13921", "13923", "13960", "14131", "15110", "16290", "19200",
-    "20110", "20120", "20130", "20140", "20150", "20160", "20170", "20200", "20301",
-    "20302", "20411", "20412", "20590", "21100", "22210", "22290", "23190", "23910",
-    "23990", "24100", "24200", "24310", "24320", "24330", "24340", "24410", "24420",
-    "24430", "24440", "24450", "24460", "24510", "25110", "25210", "25500", "25990",
-    "26110", "26200", "26300", "26511", "26512", "26600", "27110", "27200", "28110",
-    "28290", "28300", "28990", "29100", "29310", "30110", "30300", "31090", "32990",
-}
+RESTRICTED_SIC_CODES = {"46110", "46120", "46130", "46140", "46150", "46160", "46170", "46180", "46190", "46210", "46220", "46230", "46240", "46310", "46320", "46330", "46341", "46342", "46350", "46360", "46370", "46380", "46390", "46410", "46420", "46431", "46439", "46440", "46450", "46460", "46470", "46480", "46499", "46510", "46520", "46530", "46610", "46620", "46630", "46640", "46650", "46660", "46690", "46711", "46719", "46720", "46730", "46740", "46750", "46900", "10110", "10130", "10310", "10410", "10511", "10512", "10611", "10612", "10840", "10850", "10890", "10920", "13100", "13200", "13300", "13921", "13923", "13960", "14131", "15110", "16290", "19200", "20110", "20120", "20130", "20140", "20150", "20160", "20170", "20200", "20301", "20302", "20411", "20412", "20590", "21100", "22210", "22290", "23190", "23910", "23990", "24100", "24200", "24310", "24320", "24330", "24340", "24410", "24420", "24430", "24440", "24450", "24460", "24510", "25110", "25210", "25500", "25990", "26110", "26200", "26300", "26511", "26512", "26600", "27110", "27200", "28110", "28290", "28300", "28990", "29100", "29310", "30110", "30300", "31090", "32990"}
 BUZZWORDS = ("ai", "capital", "europe", "global", "group", "holdings", "inc", "labs", "london", "pty", "pvt", "technologies", "technology", "uk")
 TARGET_COUNTRIES = ("eu", "eea", "usa", "india")
 WORKER_NAME = "company_stream_worker"
-
 _worker_lock = threading.Lock()
 _worker_thread: threading.Thread | None = None
 _stop_event = threading.Event()
 
 
 def db_connection() -> psycopg.Connection:
-    url = os.getenv("DATABASE_URL")
+    url = setting("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL is not configured")
     return psycopg.connect(url, row_factory=dict_row, connect_timeout=15)
@@ -102,31 +98,9 @@ def uk_today() -> date:
     return datetime.now(ZoneInfo("Europe/London")).date()
 
 
-def parse_date(value: Any) -> date | None:
-    if not value:
-        return None
-    try:
-        return date.fromisoformat(str(value)[:10])
-    except ValueError:
-        return None
-
-
 def update_status(status: str, error: str | None = None) -> None:
     now = datetime.now(timezone.utc)
-    db_write(
-        """
-        insert into public.worker_status
-            (worker_name, process_id, status, heartbeat_at, last_error, updated_at)
-        values (%s, %s, %s, %s, %s, %s)
-        on conflict (worker_name) do update set
-            process_id = excluded.process_id,
-            status = excluded.status,
-            heartbeat_at = excluded.heartbeat_at,
-            last_error = excluded.last_error,
-            updated_at = excluded.updated_at
-        """,
-        (WORKER_NAME, str(os.getpid()), status, now, error, now),
-    )
+    db_write("""insert into public.worker_status(worker_name, process_id, status, heartbeat_at, last_error, updated_at) values (%s, %s, %s, %s, %s, %s) on conflict (worker_name) do update set process_id=excluded.process_id, status=excluded.status, heartbeat_at=excluded.heartbeat_at, last_error=excluded.last_error, updated_at=excluded.updated_at""", (WORKER_NAME, str(os.getpid()), status, now, error, now))
 
 
 def get_checkpoint() -> int | None:
@@ -136,20 +110,7 @@ def get_checkpoint() -> int | None:
 
 def save_checkpoint(timepoint: int) -> None:
     now = datetime.now(timezone.utc)
-    db_write(
-        """
-        insert into public.stream_checkpoints
-            (stream_name, timepoint, connection_status, last_event_at, last_heartbeat_at, updated_at)
-        values ('companies', %s, 'connected', %s, %s, %s)
-        on conflict (stream_name) do update set
-            timepoint = excluded.timepoint,
-            connection_status = 'connected',
-            last_event_at = excluded.last_event_at,
-            last_heartbeat_at = excluded.last_heartbeat_at,
-            updated_at = excluded.updated_at
-        """,
-        (timepoint, now, now, now),
-    )
+    db_write("""insert into public.stream_checkpoints(stream_name, timepoint, connection_status, last_event_at, last_heartbeat_at, updated_at) values ('companies', %s, 'connected', %s, %s, %s) on conflict (stream_name) do update set timepoint=excluded.timepoint, connection_status='connected', last_event_at=excluded.last_event_at, last_heartbeat_at=excluded.last_heartbeat_at, updated_at=excluded.updated_at""", (timepoint, now, now, now))
 
 
 def request_json(path: str) -> dict[str, Any]:
@@ -166,15 +127,13 @@ def restricted_evidence(company_number: str) -> dict[str, Any]:
     pscs = request_json(f"/company/{company_number}/persons-with-significant-control")
     directors = []
     for officer in officers.get("items") or []:
-        role = normalize(officer.get("officer_role"))
         address = officer.get("address") or {}
         country = normalize(address.get("country"))
-        if role in {"director", "corporate-director"} and any(country == normalize(target) or normalize(target) in country for target in TARGET_COUNTRIES):
+        if normalize(officer.get("officer_role")) in {"director", "corporate-director"} and any(normalize(target) in country for target in TARGET_COUNTRIES):
             directors.append({"name": officer.get("name"), "role": officer.get("officer_role"), "country": address.get("country"), "appointed_on": officer.get("appointed_on")})
     corporate_pscs = []
     for psc in pscs.get("items") or []:
-        kind = normalize(psc.get("kind"))
-        if "corporate" in kind or "legal entity" in kind:
+        if "corporate" in normalize(psc.get("kind")) or "legal entity" in normalize(psc.get("kind")):
             corporate_pscs.append({"name": psc.get("name"), "kind": psc.get("kind"), "natures_of_control": psc.get("natures_of_control") or []})
     return {"profile": profile, "directors": directors, "corporate_pscs": corporate_pscs, "qualified": bool(directors or corporate_pscs)}
 
@@ -187,10 +146,10 @@ def process_event(payload: dict[str, Any], event_hash: str) -> None:
         return
     received = datetime.now(timezone.utc)
     db_write("insert into public.raw_events(event_type, company_number, payload, received_at) values (%s, %s, %s, %s)", (event.get("type"), company_number, json.dumps(payload, default=str), received))
-    name = data.get("company_name") or company_number
     creation = parse_date(data.get("date_of_creation"))
     if creation != uk_today():
         return
+    name = data.get("company_name") or company_number
     sics = data.get("sic_codes") or []
     target_sics = matching_sics(sics, TARGET_SIC_CODES)
     restricted_sics = matching_sics(sics, RESTRICTED_SIC_CODES)
@@ -210,25 +169,18 @@ def process_event(payload: dict[str, Any], event_hash: str) -> None:
             qualified = bool(evidence.get("qualified"))
             enrichment_status = "complete"
             lead_status = "qualified" if qualified else "not_qualified"
-    db_write(
-        """
-        insert into public.companies
-            (company_number, company_name, date_of_creation, sic_codes, raw_data, first_seen_at, last_seen_at,
-             enrichment_status, is_lead, lead_status, matched_buzzwords, matched_sic_codes, incorporated_today,
-             last_screened_at, qualification_evidence)
-        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, %s, %s)
-        on conflict (company_number) do update set
-            company_name = excluded.company_name, date_of_creation = excluded.date_of_creation, sic_codes = excluded.sic_codes,
-            raw_data = excluded.raw_data, last_seen_at = excluded.last_seen_at, enrichment_status = excluded.enrichment_status,
-            is_lead = excluded.is_lead, lead_status = excluded.lead_status, matched_buzzwords = excluded.matched_buzzwords,
-            matched_sic_codes = excluded.matched_sic_codes, incorporated_today = true, last_screened_at = excluded.last_screened_at,
-            qualification_evidence = excluded.qualification_evidence
-        """,
-        (company_number, name, creation, json.dumps(sics), json.dumps(data, default=str), received, received, enrichment_status, qualified,
-         lead_status, json.dumps(buzzword_matches), json.dumps(sorted(set(target_sics + restricted_sics))), received, json.dumps(evidence, default=str)),
-    )
+    db_write("""insert into public.companies(company_number, company_name, date_of_creation, sic_codes, raw_data, first_seen_at, last_seen_at, enrichment_status, is_lead, lead_status, matched_buzzwords, matched_sic_codes, incorporated_today, last_screened_at, qualification_evidence) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, %s, %s) on conflict (company_number) do update set company_name=excluded.company_name, date_of_creation=excluded.date_of_creation, sic_codes=excluded.sic_codes, raw_data=excluded.raw_data, last_seen_at=excluded.last_seen_at, enrichment_status=excluded.enrichment_status, is_lead=excluded.is_lead, lead_status=excluded.lead_status, matched_buzzwords=excluded.matched_buzzwords, matched_sic_codes=excluded.matched_sic_codes, incorporated_today=true, last_screened_at=excluded.last_screened_at, qualification_evidence=excluded.qualification_evidence""", (company_number, name, creation, json.dumps(sics), json.dumps(data, default=str), received, received, enrichment_status, qualified, lead_status, json.dumps(buzzword_matches), json.dumps(sorted(set(target_sics + restricted_sics))), received, json.dumps(evidence, default=str)))
     if restricted and not ENRICHMENT_ENABLED:
         db_write("insert into public.enrichment_jobs(company_number, enrichment_scope) values (%s, 'restricted_sic') on conflict (company_number, enrichment_scope) do nothing", (company_number,))
+
+
+def parse_date(value: Any) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
 
 
 def stream_loop() -> None:
@@ -308,34 +260,23 @@ def indicator(label: str, active: bool) -> None:
 
 def dashboard() -> None:
     st.set_page_config(page_title="Thanos dashboard", page_icon="🟢", layout="wide")
-    st.markdown("""<style>
-    .status-bar {display:flex; gap:2rem; padding:1rem; border:1px solid #333; border-radius:10px; margin-bottom:1rem;}
-    .status-item {display:flex; align-items:center; gap:.5rem; font-size:1.05rem;}
-    .dot {width:13px; height:13px; border-radius:50%; display:inline-block;}
-    .active {background:#18c964; box-shadow:0 0 8px #18c964; animation:pulse 1.2s infinite;}
-    .inactive {background:#777;}
-    @keyframes pulse {0%,100%{opacity:1}50%{opacity:.35}}
-    </style>""", unsafe_allow_html=True)
+    st.markdown("""<style>.status-bar{display:flex;gap:2rem;padding:1rem;border:1px solid #333;border-radius:10px;margin-bottom:1rem}.status-item{display:flex;align-items:center;gap:.5rem;font-size:1.05rem}.dot{width:13px;height:13px;border-radius:50%;display:inline-block}.active{background:#18c964;box-shadow:0 0 8px #18c964;animation:pulse 1.2s infinite}.inactive{background:#777}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}</style>""", unsafe_allow_html=True)
     st.title("Thanos dashboard")
     try:
         with db_connection() as conn:
             conn.execute("select 1").fetchone()
-        db_ok = True
-        db_error = ""
+        db_ok, db_error = True, ""
     except Exception as exc:
-        db_ok = False
-        db_error = str(exc)
+        db_ok, db_error = False, str(exc)
     worker_status, worker_row = health()
-    worker_active = worker_status in {"connected", "connecting"}
     st.markdown('<div class="status-bar">', unsafe_allow_html=True)
     indicator("Database", db_ok)
-    indicator("Worker", worker_active)
+    indicator("Worker", worker_status in {"connected", "connecting"})
     st.markdown('</div>', unsafe_allow_html=True)
     if db_error:
         st.error(db_error)
     if worker_row and worker_row.get("last_error"):
         st.warning(worker_row["last_error"])
-
     today = uk_today()
     metrics = db_fetch_one("""
         select
@@ -356,19 +297,16 @@ def dashboard() -> None:
     m[3].metric("SIC leads", metrics.get("sic_leads", 0))
     m[4].metric("Buzzword leads", metrics.get("buzzword_leads", 0))
     m[5].metric("Restricted screened", metrics.get("restricted_screened", 0))
-
     if st.button("Start worker", type="primary"):
         st.success("Worker started") if start_worker() else st.info("Worker is already running")
     if st.button("Refresh dashboard"):
         st.rerun()
-
     st.subheader("Lead stream")
     leads = db_fetch_all("select * from public.qualifying_leads order by first_seen_at desc")
     if leads:
         st.dataframe(leads, use_container_width=True, hide_index=True)
     else:
         st.info("Awaiting new qualifying leads. The worker is listening and will publish matching companies here.")
-
     st.caption(f"Last raw event: {events.get('last_event') or 'Awaiting first event'}")
 
 
